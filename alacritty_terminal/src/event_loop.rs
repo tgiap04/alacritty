@@ -26,6 +26,9 @@ pub(crate) const READ_BUFFER_SIZE: usize = 0x10_0000;
 /// Max bytes to read from the PTY while the terminal is locked.
 const MAX_LOCKED_READ: usize = u16::MAX as usize;
 
+/// Observer of the raw bytes read from the PTY, see [`EventLoop::set_output_tap`].
+pub type OutputTap = Box<dyn FnMut(&[u8]) + Send>;
+
 /// Messages that may be sent to the `EventLoop`.
 #[derive(Debug)]
 pub enum Msg {
@@ -52,6 +55,7 @@ pub struct EventLoop<T: tty::EventedPty, U: EventListener> {
     event_proxy: U,
     drain_on_exit: bool,
     ref_test: bool,
+    output_tap: Option<OutputTap>,
 }
 
 impl<T, U> EventLoop<T, U>
@@ -78,7 +82,17 @@ where
             event_proxy,
             drain_on_exit,
             ref_test,
+            output_tap: None,
         })
+    }
+
+    /// Observe every byte read from the PTY, in order and exactly once.
+    ///
+    /// The tap runs on the PTY reader thread while the [`Term`] lock is held and before the
+    /// bytes are parsed, so state read under that same lock is consistent with the bytes seen
+    /// so far. It must be fast and must not lock the terminal.
+    pub fn set_output_tap(&mut self, tap: Option<OutputTap>) {
+        self.output_tap = tap;
     }
 
     pub fn channel(&self) -> EventLoopSender {
@@ -148,6 +162,10 @@ where
             // Write a copy of the bytes to the ref test file.
             if let Some(writer) = &mut writer {
                 writer.write_all(&buf[..unprocessed]).unwrap();
+            }
+
+            if let Some(tap) = &mut self.output_tap {
+                tap(&buf[..unprocessed]);
             }
 
             // Parse the incoming bytes.
@@ -481,5 +499,148 @@ impl<T> PeekableReceiver<T> {
                 res => res.ok(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Mutex;
+
+    use polling::Poller;
+
+    use crate::event::VoidListener;
+    use crate::term::Config;
+    use crate::term::test::TermSize;
+
+    /// PTY double whose reader yields scripted chunks, then reports end of data.
+    struct FakePty {
+        chunks: VecDeque<Vec<u8>>,
+        sink: io::Sink,
+    }
+
+    impl io::Read for FakePty {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let Some(chunk) = self.chunks.pop_front() else {
+                return Ok(0);
+            };
+            buf[..chunk.len()].copy_from_slice(&chunk);
+            Ok(chunk.len())
+        }
+    }
+
+    impl tty::EventedReadWrite for FakePty {
+        type Reader = FakePty;
+        type Writer = io::Sink;
+
+        unsafe fn register(
+            &mut self,
+            _: &Arc<Poller>,
+            _: PollingEvent,
+            _: PollMode,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn reregister(&mut self, _: &Arc<Poller>, _: PollingEvent, _: PollMode) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn deregister(&mut self, _: &Arc<Poller>) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn reader(&mut self) -> &mut Self::Reader {
+            self
+        }
+
+        fn writer(&mut self) -> &mut Self::Writer {
+            &mut self.sink
+        }
+    }
+
+    impl tty::EventedPty for FakePty {
+        fn next_child_event(&mut self) -> Option<tty::ChildEvent> {
+            None
+        }
+    }
+
+    impl event::OnResize for FakePty {
+        fn on_resize(&mut self, _: WindowSize) {}
+    }
+
+    fn event_loop(
+        chunks: &[&[u8]],
+    ) -> (EventLoop<FakePty, VoidListener>, Arc<FairMutex<Term<VoidListener>>>) {
+        let terminal = Arc::new(FairMutex::new(Term::new(
+            Config::default(),
+            &TermSize::new(80, 24),
+            VoidListener,
+        )));
+        let pty = FakePty {
+            chunks: chunks.iter().map(|chunk| chunk.to_vec()).collect(),
+            sink: io::sink(),
+        };
+        let event_loop = EventLoop::new(terminal.clone(), VoidListener, pty, false, false)
+            .expect("create event loop");
+        (event_loop, terminal)
+    }
+
+    #[test]
+    fn output_tap_receives_exactly_the_bytes_read_under_the_term_lock() {
+        let (mut event_loop, terminal) = event_loop(&[b"hello ", b"\x1b[31mworld\x1b[0m\r\n"]);
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let lock_was_held = Arc::new(Mutex::new(Vec::new()));
+        event_loop.set_output_tap(Some(Box::new({
+            let seen = seen.clone();
+            let lock_was_held = lock_was_held.clone();
+            let terminal = terminal.clone();
+            move |bytes| {
+                lock_was_held.lock().unwrap().push(terminal.try_lock_unfair().is_none());
+                seen.lock().unwrap().extend_from_slice(bytes);
+            }
+        })));
+
+        let mut state = State::default();
+        let mut buf = [0u8; 4096];
+        event_loop.pty_read::<io::Sink>(&mut state, &mut buf, None).expect("pty_read");
+
+        assert_eq!(*seen.lock().unwrap(), b"hello \x1b[31mworld\x1b[0m\r\n");
+        let lock_was_held = lock_was_held.lock().unwrap();
+        assert!(!lock_was_held.is_empty());
+        assert!(lock_was_held.iter().all(|held| *held));
+
+        // The bytes were still parsed after being tapped.
+        let term = terminal.lock();
+        assert_eq!(term.grid()[crate::index::Line(0)][crate::index::Column(0)].c, 'h');
+    }
+
+    #[test]
+    fn unset_output_tap_does_not_affect_parsing() {
+        let (mut event_loop, terminal) = event_loop(&[b"abc"]);
+        let mut state = State::default();
+        let mut buf = [0u8; 4096];
+        event_loop.pty_read::<io::Sink>(&mut state, &mut buf, None).expect("pty_read");
+
+        let term = terminal.lock();
+        assert_eq!(term.grid()[crate::index::Line(0)][crate::index::Column(2)].c, 'c');
+    }
+
+    #[test]
+    fn output_tap_can_be_cleared() {
+        let (mut event_loop, _terminal) = event_loop(&[b"abc"]);
+        let calls = Arc::new(Mutex::new(0usize));
+        event_loop.set_output_tap(Some(Box::new({
+            let calls = calls.clone();
+            move |_| *calls.lock().unwrap() += 1
+        })));
+        event_loop.set_output_tap(None);
+
+        let mut state = State::default();
+        let mut buf = [0u8; 4096];
+        event_loop.pty_read::<io::Sink>(&mut state, &mut buf, None).expect("pty_read");
+        assert_eq!(*calls.lock().unwrap(), 0);
     }
 }
