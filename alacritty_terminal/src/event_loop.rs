@@ -171,6 +171,10 @@ where
             // Parse the incoming bytes.
             state.parser.advance(&mut **terminal, &buf[..unprocessed]);
 
+            // The parser is invisible to `Term`, so publish its sync state before the lock is
+            // released.
+            terminal.set_sync_pending(state.in_synchronized_update());
+
             processed += unprocessed;
             unprocessed = 0;
 
@@ -186,6 +190,13 @@ where
         }
 
         Ok(())
+    }
+
+    /// Apply the bytes held back by a synchronized update whose timeout was reached.
+    fn expire_synchronized_update(&mut self, state: &mut State) {
+        let mut terminal = self.terminal.lock();
+        state.parser.stop_sync(&mut *terminal);
+        terminal.set_sync_pending(state.in_synchronized_update());
     }
 
     #[inline]
@@ -261,7 +272,7 @@ where
 
                 // Handle synchronized update timeout.
                 if events.is_empty() && self.rx.peek().is_none() {
-                    state.parser.stop_sync(&mut *self.terminal.lock());
+                    self.expire_synchronized_update(&mut state);
                     self.event_proxy.send_event(Event::Wakeup);
                     continue;
                 }
@@ -422,6 +433,15 @@ pub struct State {
 }
 
 impl State {
+    /// Whether the parser is inside a synchronized update.
+    ///
+    /// This is true from the moment the start sequence is parsed, before any byte has been held
+    /// back.
+    #[inline]
+    fn in_synchronized_update(&self) -> bool {
+        self.parser.sync_timeout().sync_timeout().is_some()
+    }
+
     #[inline]
     fn ensure_next(&mut self) {
         if self.writing.is_none() {
@@ -642,5 +662,114 @@ mod tests {
         let mut buf = [0u8; 4096];
         event_loop.pty_read::<io::Sink>(&mut state, &mut buf, None).expect("pty_read");
         assert_eq!(*calls.lock().unwrap(), 0);
+    }
+
+    fn read_pending_chunks(event_loop: &mut EventLoop<FakePty, VoidListener>, state: &mut State) {
+        let mut buf = [0u8; 4096];
+        event_loop.pty_read::<io::Sink>(state, &mut buf, None).expect("pty_read");
+    }
+
+    #[test]
+    fn sync_update_start_with_text_marks_sync_pending() {
+        let (mut event_loop, terminal) = event_loop(&[b"\x1b[?2026hhello"]);
+        assert!(!terminal.lock().is_sync_pending());
+
+        read_pending_chunks(&mut event_loop, &mut State::default());
+
+        let term = terminal.lock();
+        assert!(term.is_sync_pending());
+        // The text is held back by the parser, so the grid has not seen it yet.
+        assert_eq!(term.grid()[crate::index::Line(0)][crate::index::Column(0)].c, ' ');
+    }
+
+    #[test]
+    fn sync_update_start_alone_marks_sync_pending() {
+        let (mut event_loop, terminal) = event_loop(&[b"\x1b[?2026h"]);
+
+        read_pending_chunks(&mut event_loop, &mut State::default());
+
+        assert!(terminal.lock().is_sync_pending());
+    }
+
+    #[test]
+    fn sync_update_end_clears_sync_pending_and_applies_the_held_bytes() {
+        let (mut event_loop, terminal) = event_loop(&[b"\x1b[?2026hhello"]);
+        let mut state = State::default();
+        read_pending_chunks(&mut event_loop, &mut state);
+        assert!(terminal.lock().is_sync_pending());
+
+        event_loop.pty.chunks.push_back(b"\x1b[?2026l".to_vec());
+        read_pending_chunks(&mut event_loop, &mut state);
+
+        let term = terminal.lock();
+        assert!(!term.is_sync_pending());
+        assert_eq!(term.grid()[crate::index::Line(0)][crate::index::Column(0)].c, 'h');
+    }
+
+    #[test]
+    fn back_to_back_sync_updates_stay_pending() {
+        let (mut event_loop, terminal) = event_loop(&[b"\x1b[?2026hone\x1b[?2026l\x1b[?2026htwo"]);
+
+        read_pending_chunks(&mut event_loop, &mut State::default());
+
+        let term = terminal.lock();
+        assert!(term.is_sync_pending());
+        assert_eq!(term.grid()[crate::index::Line(0)][crate::index::Column(0)].c, 'o');
+        assert_eq!(term.grid()[crate::index::Line(0)][crate::index::Column(3)].c, ' ');
+    }
+
+    #[test]
+    fn sync_update_timeout_clears_sync_pending_and_applies_the_held_bytes() {
+        let (mut event_loop, terminal) = event_loop(&[b"\x1b[?2026hhello"]);
+        let mut state = State::default();
+        read_pending_chunks(&mut event_loop, &mut state);
+        assert!(terminal.lock().is_sync_pending());
+
+        event_loop.expire_synchronized_update(&mut state);
+
+        let term = terminal.lock();
+        assert!(!term.is_sync_pending());
+        assert_eq!(term.grid()[crate::index::Line(0)][crate::index::Column(0)].c, 'h');
+    }
+
+    #[test]
+    fn sync_pending_stays_false_without_a_sync_update() {
+        let (mut event_loop, terminal) = event_loop(&[b"plain output\r\n"]);
+
+        read_pending_chunks(&mut event_loop, &mut State::default());
+
+        assert!(!terminal.lock().is_sync_pending());
+    }
+
+    #[test]
+    fn decstbm_changes_the_reported_scroll_region() {
+        use crate::index::Line;
+
+        let (mut event_loop, terminal) = event_loop(&[b"\x1b[5;10r"]);
+        assert_eq!(*terminal.lock().scroll_region(), Line(0)..Line(24));
+
+        let mut state = State::default();
+        read_pending_chunks(&mut event_loop, &mut state);
+        assert_eq!(*terminal.lock().scroll_region(), Line(4)..Line(10));
+
+        event_loop.pty.chunks.push_back(b"\x1b[r".to_vec());
+        read_pending_chunks(&mut event_loop, &mut state);
+        assert_eq!(*terminal.lock().scroll_region(), Line(0)..Line(24));
+    }
+
+    #[test]
+    fn shift_out_and_in_change_the_active_charset() {
+        use crate::vte::ansi::CharsetIndex;
+
+        let (mut event_loop, terminal) = event_loop(&[b"\x0e"]);
+        assert_eq!(terminal.lock().active_charset(), CharsetIndex::G0);
+
+        let mut state = State::default();
+        read_pending_chunks(&mut event_loop, &mut state);
+        assert_eq!(terminal.lock().active_charset(), CharsetIndex::G1);
+
+        event_loop.pty.chunks.push_back(b"\x0f".to_vec());
+        read_pending_chunks(&mut event_loop, &mut state);
+        assert_eq!(terminal.lock().active_charset(), CharsetIndex::G0);
     }
 }

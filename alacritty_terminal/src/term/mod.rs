@@ -327,6 +327,12 @@ pub struct Term<T> {
 
     /// Config directly for the terminal.
     config: Config,
+
+    /// Whether the event loop's parser is inside a synchronized update.
+    ///
+    /// The parser lives outside of `Term`, so the event loop mirrors its state here while it
+    /// still holds the terminal lock.
+    sync_pending: bool,
 }
 
 /// Configuration options for the [`Term`].
@@ -441,6 +447,7 @@ impl<T> Term<T> {
             selection: Default::default(),
             title: Default::default(),
             mode: Default::default(),
+            sync_pending: false,
         }
     }
 
@@ -708,6 +715,37 @@ impl<T> Term<T> {
     #[inline]
     pub fn mode(&self) -> &TermMode {
         &self.mode
+    }
+
+    /// Scroll region (DECSTBM).
+    ///
+    /// Range going from top to bottom of the terminal, indexed from the top of the viewport. The
+    /// end is exclusive.
+    #[inline]
+    pub fn scroll_region(&self) -> &Range<Line> {
+        &self.scroll_region
+    }
+
+    /// Charset slot that ASCII is currently mapped through.
+    ///
+    /// The mapping of each slot is in `grid().cursor.charsets`.
+    #[inline]
+    pub fn active_charset(&self) -> CharsetIndex {
+        self.active_charset
+    }
+
+    /// Whether the PTY parser is inside a synchronized update (DEC mode 2026).
+    ///
+    /// While this is true, bytes read from the PTY are held back by the parser and are not
+    /// reflected in the grid until the update ends or times out.
+    #[inline]
+    pub fn is_sync_pending(&self) -> bool {
+        self.sync_pending
+    }
+
+    #[inline]
+    pub(crate) fn set_sync_pending(&mut self, sync_pending: bool) {
+        self.sync_pending = sync_pending;
     }
 
     /// Swap primary and alternate screen buffer.
@@ -1837,6 +1875,7 @@ impl<T: EventListener> Handler for Term<T> {
             mem::swap(&mut self.grid, &mut self.inactive_grid);
         }
         self.active_charset = Default::default();
+        self.sync_pending = false;
         self.cursor_style = None;
         self.grid.reset();
         self.inactive_grid.reset();
@@ -2755,6 +2794,26 @@ mod tests {
         term.input('a');
 
         assert_eq!(term.grid()[cursor].c, '▒');
+    }
+
+    #[test]
+    fn reset_state_restores_what_the_snapshot_accessors_report() {
+        let size = TermSize::new(7, 17);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let full_region = term.scroll_region().clone();
+
+        term.set_scrolling_region(3, Some(6));
+        term.set_active_charset(CharsetIndex::G2);
+        term.set_sync_pending(true);
+        assert_ne!(*term.scroll_region(), full_region);
+        assert_eq!(term.active_charset(), CharsetIndex::G2);
+        assert!(term.is_sync_pending());
+
+        term.reset_state();
+
+        assert_eq!(*term.scroll_region(), full_region);
+        assert_eq!(term.active_charset(), CharsetIndex::G0);
+        assert!(!term.is_sync_pending());
     }
 
     #[test]
